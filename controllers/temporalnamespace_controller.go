@@ -24,6 +24,9 @@ import (
 	"time"
 
 	"github.com/alexandrevilain/controller-tools/pkg/patch"
+	namespaceUtils "github.com/alexandrevilain/temporal-operator/internal/resource/namespace"
+	"github.com/go-logr/logr"
+	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/api/serviceerror"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -136,11 +139,102 @@ func (r *TemporalNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 	}
 
+	err = r.reconcileCustomSearchAttributes(ctx, &logger, namespace, cluster)
+	if err != nil {
+		logger.Info(fmt.Sprintf("Failed to reconcile custom search attributes: %v", err))
+		return r.handleError(namespace, v1beta1.ReconcileErrorReason, err)
+	}
 	logger.Info("Successfully reconciled namespace", "namespace", namespace.GetName())
 
 	v1beta1.SetTemporalNamespaceReady(namespace, metav1.ConditionTrue, v1beta1.TemporalNamespaceCreatedReason, "Namespace successfully created")
 
 	return r.handleSuccess(namespace)
+}
+
+// reconcileCustomSearchAttributes ensures that custom search attributes on the Temporal server exactly match those defined in the spec.
+//
+// NOTE: Reconciliation of custom search attributes is accomplished using these steps:
+//
+// 1. Retrieve the custom search attributes which are currently on the Temporal server.
+// 2. Determine which custom search attributes need to be removed, if any.
+// 3. Determine which custom search attributes need to be added, if any.
+// 4. If needed, request the Temporal server to remove the necessary custom search attributes.
+// 5. If needed, request the Temporal server to add the necessary custom search attributes.
+//
+// Some of these steps may fail if some Temporal search attribute constraint is violated; in which case this function will return early with a helpful error message.
+func (r *TemporalNamespaceReconciler) reconcileCustomSearchAttributes(ctx context.Context, logger *logr.Logger, namespace *v1beta1.TemporalNamespace, cluster *v1beta1.TemporalCluster) error {
+	// Construct a client to talk to the Temporal server
+	client, err := temporal.GetClusterClient(ctx, r.Client, cluster)
+	if err != nil {
+		return err
+	}
+	// Requests to Temporal's OperatorService API need to specify the namespace name, so capture it here for future use.
+	ns := namespace.GetName()
+
+	// List all search attributes that are currently on the Temporal server
+	listRequest := &operatorservice.ListSearchAttributesRequest{Namespace: ns}
+	serverSearchAttributes, err := client.OperatorService().ListSearchAttributes(ctx, listRequest)
+	if err != nil {
+		return err
+	}
+
+	// Narrow the focus to custom search attributes only.
+	serverCustomSearchAttributes := &serverSearchAttributes.CustomAttributes // use a pointer to avoid unnecessary copying
+
+	// Note that the CustomSearchAttributes map data structure that is built using the Spec merely maps string->string.
+	// To rigorously compare search attributes between the spec and the Temporal server, the types need to be consistent.
+	// We therefore construct a string->enums.IndexedValueType map from the "weaker" string->string map.
+	specCustomSearchAttributes, err := namespaceUtils.CreateIndexedValueTypeMap(&namespace.Spec.CustomSearchAttributes)
+	if err != nil {
+		return err
+	}
+
+	customSearchAttributesToRemove := make([]string, 0)
+	for serverSearchAttributeName, serverSearchAttributeType := range *serverCustomSearchAttributes {
+		specSearchAttributeType, serverSearchAttributeNameExistsInSpec := specCustomSearchAttributes[serverSearchAttributeName]
+		if !serverSearchAttributeNameExistsInSpec {
+			// Remove those custom search attributes from the Temporal server whose name does not exist in the Spec.
+			customSearchAttributesToRemove = append(customSearchAttributesToRemove, serverSearchAttributeName)
+		} else {
+			// If the Temporal server already has a custom search attribute with the same name but a different type
+			// delete it, and recreate with the correct type.
+			if specSearchAttributeType != serverSearchAttributeType {
+				customSearchAttributesToRemove = append(customSearchAttributesToRemove, serverSearchAttributeName)
+			} else {
+				// If the Temporal server already has a custom search attribute with the same name and type
+				// don't create it
+				delete(specCustomSearchAttributes, serverSearchAttributeName)
+			}
+		}
+	}
+
+	// If there are search attributes that should be removed, then make a request to the Temporal server to remove them.
+	if len(customSearchAttributesToRemove) > 0 {
+		removeRequest := &operatorservice.RemoveSearchAttributesRequest{
+			Namespace:        ns,
+			SearchAttributes: customSearchAttributesToRemove,
+		}
+		_, err = client.OperatorService().RemoveSearchAttributes(ctx, removeRequest)
+		if err != nil {
+			return fmt.Errorf("failed to remove search attributes: %w", err)
+		}
+		logger.Info(fmt.Sprintf("removed custom search attributes: %v", customSearchAttributesToRemove))
+	}
+
+	// If there are search attributes that should be added, then make a request the Temporal server to create them.
+	if len(specCustomSearchAttributes) > 0 {
+		addRequest := &operatorservice.AddSearchAttributesRequest{
+			Namespace:        ns,
+			SearchAttributes: specCustomSearchAttributes,
+		}
+		_, err = client.OperatorService().AddSearchAttributes(ctx, addRequest)
+		if err != nil {
+			return fmt.Errorf("failed to add search attributes: %w", err)
+		}
+		logger.Info(fmt.Sprintf("added custom search attributes: %v", customSearchAttributesToRemove))
+	}
+
+	return nil
 }
 
 // ensureFinalizer ensures the deletion finalizer is set on the object if the user allowed namespace deletion using the CRD.
